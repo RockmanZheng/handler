@@ -11,6 +11,11 @@ import pymongo
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from zipfile import ZipFile,Path
+from io import BytesIO
+from tqdm import tqdm 
+from concurrent.futures import ThreadPoolExecutor,ProcessPoolExecutor
+import boto3
 
 logger = logging.getLogger(__name__)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -84,7 +89,8 @@ class Handler(object):
                 yaml.dump(self.configs,file)
         else:
             raise ValueError('Unsupported file format: %s' % (path))
-        
+
+
 
 class DatabaseHandler(Handler):
     """
@@ -173,8 +179,7 @@ class DatabaseHandler(Handler):
             return self.configs['port']
         else:
             return None
-    
-
+        
     
     def to_csv(self,
                path: str,
@@ -188,18 +193,124 @@ class DatabaseHandler(Handler):
                  path: str,
                  table: str):
         """
-        Read csv file in path into database table, replacing the existing table
+        Read csv file in path into table on database, replacing the existing table
         """
         if self.port is not None:
             logger.info('Loading csv %s into database %s:%s/%s at table %s'%(path,self.host,self.port,self.database,table))
         else:
             logger.info('Loading csv %s into database %s/%s at table %s'%(path,self.host,self.database,table))
+        
         df = pd.read_csv(filepath_or_buffer=path)
         df.to_sql(name=table,
                   con=self.engine,
                   if_exists='replace',
                   chunksize=100)
     
+    def process_zip(self,
+                    filename: str,
+                    zf: ZipFile,
+                    chunk_size: int,
+                    preproc,
+                    dtype: list,
+                    sep: str,
+                    names: list[str],
+                    table: str,
+                    pbar: tqdm):
+        with zf.open(filename,'r') as file:
+            buf = b''
+            while True:
+                chunk = file.read(chunk_size)
+                if not chunk:
+                    break
+                buf += chunk
+                # find the last end of line
+                idx = buf.rfind(b'\n')
+                if idx>0:
+                    chunk = buf[:idx+1]
+                    buf = buf[idx+1:]
+                    df = preproc(pd.read_csv(BytesIO(chunk),
+                                    sep=sep,
+                                    names=names,
+                                    dtype=dtype))
+                    df.to_sql(name=table,
+                            con=self.engine,
+                            if_exists='append',
+                            chunksize=100,
+                            index=False)
+                    pbar.update(len(chunk))# update progress bar
+        return 0
+    
+    def calc_zip_file_size(self,
+                           zf: ZipFile,
+                           filename: str) -> int:
+        """
+        Calculate the size of one file in the zip file
+        """
+        size=0
+        with zf.open(filename) as file:
+            file.seek(0,2)
+            size = file.tell()
+        return size
+
+    def calc_zip_size(self,
+                      zf: ZipFile):
+        """
+        Calculate the original total size of all files in the zip file
+        """
+        logger.info('Getting the total zip size ...')
+        size = 0
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            for filename in zf.namelist():
+                futures.append(executor.submit(self.calc_zip_file_size,zf=zf,filename=filename))
+            for future in futures:
+                size += future.result()
+        return size
+
+
+    def read_zip(self,
+                 path: str,
+                 table: str,
+                 names: list[str],
+                 chunk_size: int = 1280000,
+                 sep: str = ',',
+                 preproc = None,
+                 dtype: list = None):
+        """
+        Read all csv files compressed in one single zip file into table on database
+
+        Parameters:
+            - path (str): The path to zip file
+            - table (str): The destination table in database
+            - names (list[str]): A list of column names, if there are too many columns, you can just set them arbitrarily first, and reset them in the database later
+            - chunk_size (int, optional): The data amount in bytes each time we read from the zip file into the memory
+            - sep (str, optional): Separator in csv file
+            - preproc (function, optional): Preprocess function, takes a pd.DataFrame as input and output another pd.DataFrame to upload to the database
+        """
+        if self.port is not None:
+            logger.info('Loading zip %s into database %s:%s/%s at table %s'%(path,self.host,self.port,self.database,table))
+        else:
+            logger.info('Loading zip %s into database %s/%s at table %s'%(path,self.host,self.database,table))
+        
+        with ZipFile(path,'r') as zf:
+            with tqdm(total=self.calc_zip_size(zf)) as pbar:
+                futures = []
+                with ThreadPoolExecutor() as executor:
+                    for filename in zf.namelist():
+                        futures.append(executor.submit(self.process_zip,
+                                                       filename=filename,
+                                                        zf=zf,
+                                                        chunk_size=chunk_size,
+                                                        preproc=preproc,
+                                                        dtype=dtype,
+                                                        sep=sep,
+                                                        names=names,
+                                                        table=table,
+                                                        pbar=pbar))
+                    for future in futures:
+                        future.result()
+
+
     def exec_sql(self,
                  sql: str,
                  index_col: str|list[str] = None):
@@ -434,5 +545,91 @@ class EmailHandler(object):
         finally:
             # Close the SMTP server connection
             server.quit()
+
+
+class AwsS3Handler(object):
+    def __init__(self,
+                 bucket: str):
+        self.client = boto3.client('s3')
+        self.bucket = bucket
+    
+    def upload_part(self,
+                    chunk: bytes,
+                    key: str,
+                    num: int,
+                    upload_id: str,
+                    pbar: tqdm):
+        """
+        Wrapper for S3 upload_part
+        """
+        response = self.client.upload_part(Body=chunk,
+                                            Bucket=self.bucket,
+                                            Key=key,
+                                            PartNumber=num,
+                                            UploadId=upload_id)
+        pbar.update(len(chunk))
+        return response,num
+
+    def upload_file(self,
+                   path: str,
+                   chunk_size: int = 134217728,
+                   key: str = None,
+                   upload_freq: int = 10):
+        """
+        Upload file efficiently using concurrency and AWS S3 multipart upload API
+        """
+        logger.info('Loading %s into AWS S3 bucket %s ...'%(path,self.bucket))
+        if key is None:
+            key = path
+        with open(path,'rb') as file:
+            file.seek(0,2)
+            size = file.tell()
+            file.seek(0,0)
+            if size>chunk_size:# too large, upload multipart
+                with tqdm(total=size) as pbar:
+                    multipart_response = self.client.create_multipart_upload(Bucket=self.bucket,
+                                                                            Key=key)
+                    
+                    count=1
+                    upload_metadata = {}
+                    upload_metadata['Parts'] = []
+                    
+                    futures = []
+                    with ThreadPoolExecutor() as executor:
+                        while True:
+                            chunk = file.read(chunk_size)
+                            if not chunk:
+                                break
+                            
+                            futures.append(executor.submit(self.upload_part,
+                                                        chunk=chunk,
+                                                        key=key,
+                                                        num=count,
+                                                        upload_id=multipart_response['UploadId'],
+                                                        pbar=pbar))
+                            count+=1
+                            if count%upload_freq==0:
+                                for future in futures:
+                                    response,num = future.result()
+                                    upload_metadata['Parts'].append({'ETag':response['ETag'],
+                                                                    'PartNumber':num})
+                                futures = []
+                        if len(futures)>0:
+                            for future in futures:
+                                response,num = future.result()
+                                upload_metadata['Parts'].append({'ETag':response['ETag'],
+                                                                'PartNumber':num})
+                            futures = []
+                        self.client.complete_multipart_upload(Bucket=self.bucket,
+                                                            Key=key,
+                                                            MultipartUpload=upload_metadata,
+                                                            UploadId = multipart_response['UploadId'])
+                        
+            else:
+                self.client.upload_fileobj(Fileobj=file,
+                                            Bucket=self.bucket,
+                                            Key=key)
+            logger.info('Complete uploading %s to AWS S3 at bucket %s'%(path,self.bucket))
+
 
 

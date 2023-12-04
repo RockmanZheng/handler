@@ -283,7 +283,7 @@ class Session(object):
         return self.handlers['config'].configs
     
     @property
-    def database(self):
+    def database(self)->DatabaseHandler:
         return self.handlers['database']
 
     def run(self,**kwarg):
